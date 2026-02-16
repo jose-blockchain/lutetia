@@ -1,6 +1,6 @@
 # Lutetia EVM Decompiler
 
-**EVM bytecode decompiler** — the fastest EVM decompiler. Turns EVM bytecode (hex or contract address) into readable pseudo-Python (Python-style `def`/`if`/`while` with EVM/Solidity types and `require`/calls).
+**EVM bytecode decompiler** — Lutetia is the fastest EVM decompiler. Turns EVM bytecode (hex or contract address) into readable pseudo-Python (Python-style `def`/`if`/`while` with EVM/Solidity types and `require`/calls).
 
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -33,11 +33,20 @@ Tested on mainnet bytecodes (WETH, USDT, DAI, Uniswap V2 Factory, Uniswap V2 Rou
 
 ## Install
 
+Lutetia is [published on crates.io](https://crates.io/crates/lutetia). Install the CLI and run `lutetia` from the command line:
+
+```bash
+cargo install lutetia
+lutetia --help
+```
+
+To install from a local clone:
+
 ```bash
 cargo install --path .
 ```
 
-Or run from the repo:
+Or build and run from the repo:
 
 ```bash
 cargo build --release
@@ -64,6 +73,31 @@ lutetia --help
 #   -o, --format <FMT>    text (default), asm, json
 #   -t, --timeout <SEC>   Execution timeout (default: 60)
 #   --no-color            Disable coloured output
+```
+
+---
+
+## Example output
+
+```text
+$ lutetia 00
+stop
+
+$ lutetia 602a60005500
+stor[0] = 42
+stop
+```
+
+Real contract output is pseudo-Python with `def`, `require`, and resolved calls/storage:
+
+```text
+def balanceOf(address account): # not payable
+  return balanceOf[account]
+
+def approve(address spender, uint256 amount): # not payable
+  allowance[caller][spender] = amount
+  log Approval(amount, address=caller, address=spender)
+  return 1
 ```
 
 ---

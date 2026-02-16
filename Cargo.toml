@@ -1,0 +1,53 @@
+[package]
+name = "lutetia"
+version = "0.1.0"
+edition = "2021"
+description = "EVM bytecode decompiler — a Rust rewrite of Panoramix"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/jose-blockchain/lutetia"  # set when repo is created
+keywords = ["evm", "decompiler", "bytecode", "ethereum", "solidity"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Big integers (U256)
+primitive-types = { version = "0.13", features = ["codec"] }
+
+# Serialisation
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# HTTP for signature lookup (fallback when local DB misses)
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+
+# Gzip decompression for the bundled signature database
+flate2 = "1"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Terminal colours
+colored = "2"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Hex encoding / decoding
+hex = "0.4"
+
+# Caching directories
+dirs = "6"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
+
+[[bin]]
+name = "lutetia"
+path = "src/main.rs"

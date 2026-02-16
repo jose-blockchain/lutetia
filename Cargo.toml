@@ -2,10 +2,10 @@
 name = "lutetia"
 version = "0.1.0"
 edition = "2021"
-description = "EVM bytecode decompiler — a Rust rewrite of Panoramix"
+description = "EVM bytecode decompiler — the fastest EVM decompiler"
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/jose-blockchain/lutetia"  # set when repo is created
+repository = "https://github.com/jose-blockchain/lutetia"
 keywords = ["evm", "decompiler", "bytecode", "ethereum", "solidity"]
 categories = ["command-line-utilities", "development-tools"]
 

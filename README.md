@@ -90,7 +90,7 @@ stop
 
 Real contract output is pseudo-Python with `def`, `require`, and resolved calls/storage:
 
-```text
+```python
 def balanceOf(address account): # not payable
   return balanceOf[account]
 

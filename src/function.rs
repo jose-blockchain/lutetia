@@ -61,12 +61,11 @@ impl Function {
         // Parse params from the signature (always, to get complete param list).
         // If the signature yields more params, use those (they include ABI names
         // and correct types for dynamic params that trace inference might miss).
-        let mut sig_params = Vec::new();
-        {
+        let mut sig_params = {
             let saved = std::mem::take(&mut f.params);
             f.parse_params_from_signature();
-            sig_params = std::mem::replace(&mut f.params, saved);
-        }
+            std::mem::replace(&mut f.params, saved)
+        };
 
         if sig_params.len() > f.params.len() {
             // Signature-based params are more complete.
@@ -82,6 +81,7 @@ impl Function {
             f.params = sig_params;
         }
 
+        f.refine_param_names();
         f.cleanup_masks();
         f.substitute_params();
         f

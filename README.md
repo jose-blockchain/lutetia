@@ -9,8 +9,7 @@
   <img src="https://fonduevilla.com/wp-content/uploads/2023/11/Asterix-Obelix-Cheese-Fondue-Adventures-in-Switzerland-26-1024x442.jpg" width="600" alt="Asterix & Obelix — Cheese Fondue" />
 </p>
 
-Decompiling EVM bytecode is a bit like staring into a fondue pot: everything’s melted together and it’s not obvious what went in. Lutetia is the Obelix at the table — we dig in and turn that goo back into something you can read.
-
+Decompiling EVM bytecode is a bit like staring into a fondue pot: everything’s melted together and it’s not obvious what went in.
 ---
 
 ## Benchmarks (vs Panoramix)

@@ -1,6 +1,6 @@
 # Lutetia EVM Decompiler
 
-**EVM bytecode decompiler** — Lutetia is the fastest EVM decompiler. Turns EVM bytecode (hex or contract address) into readable pseudo-Python (Python-style `def`/`if`/`while` with EVM/Solidity types and `require`/calls).
+**EVM bytecode decompiler** — Lutetia is the fastest EVM decompiler. Turns EVM bytecode (hex only; no network/RPC) into readable pseudo-Python (Python-style `def`/`if`/`while` with EVM/Solidity types and `require`/calls).
 
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -57,15 +57,17 @@ cargo build --release
 
 ## Usage
 
+Bytecode is **never fetched from the web**. Input is local only: hex argument, file, or stdin.
+
 ```bash
-# From hex string
+# From hex string (paste bytecode; 0x prefix optional)
 lutetia 6001600201
 
 # From file
 lutetia -f bytecode.hex
 
-# From contract address (mainnet)
-lutetia 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2
+# From stdin
+cat bytecode.hex | lutetia
 
 # Options
 lutetia --help

@@ -10,6 +10,7 @@
 </p>
 
 Decompiling EVM bytecode is a bit like staring into a fondue pot: everything’s melted together and it’s not obvious what went in.
+
 ---
 
 ## Benchmarks (vs Panoramix)

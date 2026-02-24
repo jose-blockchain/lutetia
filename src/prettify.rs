@@ -1129,12 +1129,10 @@ fn pprint_logic(expr: &Expr, indent: usize, add_color: bool, lines: &mut Vec<Str
                 }
                 if children.len() > 2 {
                     if let Some(if_false) = children.get(2) {
-                        // Skip empty else branches.
                         let is_empty = if_false.opcode() == Some("seq")
                             && if_false.children().is_none_or(|ch| ch.is_empty());
                         if !is_empty {
-                            lines.push(format!("{prefix}else:"));
-                            pprint_seq(if_false, indent + 4, add_color, lines);
+                            pprint_else_or_elif(if_false, indent, add_color, lines);
                         }
                     }
                 }
@@ -1179,6 +1177,52 @@ fn pprint_logic(expr: &Expr, indent: usize, add_color: bool, lines: &mut Vec<Str
         _ => {
             lines.push(format!("{prefix}{}", prettify(expr, add_color)));
         }
+    }
+}
+
+/// If the expression is a single "if" (or seq with one "if"), return that if node's (cond, then, else).
+fn single_if_node(expr: &Expr) -> Option<&Expr> {
+    match expr.opcode() {
+        Some("if") => Some(expr),
+        Some("seq") => {
+            let ch = expr.children()?;
+            if ch.len() == 1 && ch[0].opcode() == Some("if") {
+                Some(&ch[0])
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Emit "elif" chain when else body is "if"/"else: if"/... to avoid deep "else: if:" indentation.
+fn pprint_else_or_elif(expr: &Expr, indent: usize, add_color: bool, lines: &mut Vec<String>) {
+    let prefix = " ".repeat(indent);
+    if let Some(if_node) = single_if_node(expr) {
+        let ch = match if_node.children() {
+            Some(c) => c,
+            None => {
+                lines.push(format!("{prefix}else:"));
+                pprint_seq(expr, indent + 4, add_color, lines);
+                return;
+            }
+        };
+        let cond = prettify(&ch[0], add_color);
+        lines.push(format!("{prefix}elif {cond}:"));
+        if let Some(then_part) = ch.get(1) {
+            pprint_seq(then_part, indent + 4, add_color, lines);
+        }
+        if let Some(else_part) = ch.get(2) {
+            let empty = else_part.opcode() == Some("seq")
+                && else_part.children().map_or(false, |c| c.is_empty());
+            if !empty {
+                pprint_else_or_elif(else_part, indent, add_color, lines);
+            }
+        }
+    } else {
+        lines.push(format!("{prefix}else:"));
+        pprint_seq(expr, indent + 4, add_color, lines);
     }
 }
 
@@ -1437,6 +1481,55 @@ mod tests {
         assert!(output.contains("body_c"));
         assert!(output.contains("default"));
         assert!(output.contains("else:"));
+    }
+
+    /// Generic "else: if cond:" is printed as "elif cond:" to avoid deep indentation.
+    #[test]
+    fn test_else_if_prints_as_elif() {
+        let inner = Expr::node3(
+            "if",
+            Expr::atom("cond2"),
+            Expr::node("seq", vec![Expr::atom("then2")]),
+            Expr::node("seq", vec![Expr::atom("else2")]),
+        );
+        let outer = Expr::node3(
+            "if",
+            Expr::atom("cond1"),
+            Expr::node("seq", vec![Expr::atom("then1")]),
+            Expr::node("seq", vec![inner]),
+        );
+        let output = pprint_trace(&[outer], false);
+        assert!(output.contains("elif cond2:"), "expected 'elif cond2:' in:\n{output}");
+        assert!(!output.contains("else:\n    if cond2:"), "expected no 'else: if' in:\n{output}");
+        assert!(output.contains("then2"));
+        assert!(output.contains("else2"));
+    }
+
+    /// Elif flattening must not drop any branch: all bodies (then1, then2, then3, else3) appear.
+    #[test]
+    fn test_elif_chain_no_dropped_branches() {
+        let inner3 = Expr::node3(
+            "if",
+            Expr::atom("cond3"),
+            Expr::node("seq", vec![Expr::atom("then3")]),
+            Expr::node("seq", vec![Expr::atom("else3")]),
+        );
+        let inner2 = Expr::node3(
+            "if",
+            Expr::atom("cond2"),
+            Expr::node("seq", vec![Expr::atom("then2")]),
+            Expr::node("seq", vec![inner3]),
+        );
+        let outer = Expr::node3(
+            "if",
+            Expr::atom("cond1"),
+            Expr::node("seq", vec![Expr::atom("then1")]),
+            Expr::node("seq", vec![inner2]),
+        );
+        let output = pprint_trace(&[outer], false);
+        for body in ["then1", "then2", "then3", "else3"] {
+            assert!(output.contains(body), "elif chain must include body '{}' in:\n{}", body, output);
+        }
     }
 
     /// Single caller check (only one pair) is printed as normal if/else, not elif.

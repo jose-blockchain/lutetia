@@ -10,7 +10,7 @@ use crate::function::Function;
 use crate::loader::Loader;
 use crate::prettify::{pprint_trace, prettify};
 use crate::rewriter;
-use crate::simplify::simplify_trace;
+use crate::simplify::{flatten_caller_dispatch, simplify_trace};
 use crate::sparser;
 use crate::utils::signatures::get_func_name;
 use crate::vm::VM;
@@ -461,6 +461,9 @@ fn decompile_function(
 
     // Fold execution paths into concise if/else structures.
     let simplified = folder::fold(&simplified);
+
+    // Flatten nested caller-dispatch (if not caller == A: if not caller == B: ...) into flat if caller == A: ... if caller == B: ...
+    let simplified = flatten_caller_dispatch(&simplified);
 
     // Heuristic rewrites: require() detection, memcpy, etc.
     let simplified = rewriter::rewrite(&simplified);

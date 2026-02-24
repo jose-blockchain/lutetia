@@ -2117,6 +2117,109 @@ fn extract_seq(expr: Option<&Expr>) -> Vec<Expr> {
     }
 }
 
+// ===========================================================================
+// Flatten caller dispatch (if not caller == A: if not caller == B: ... else: body_B) else: body_A
+// ===========================================================================
+
+/// True if expr is "caller" or mask_shl(160, 0, 0, caller).
+fn is_caller_ref(expr: &Expr) -> bool {
+    match expr {
+        Expr::Atom(s) if s.as_str() == "caller" => true,
+        Expr::Node(op, ch) if op == "mask_shl" && ch.len() >= 4 => {
+            ch.last().map_or(false, |e| is_caller_ref(e))
+        }
+        _ => false,
+    }
+}
+
+/// If cond is iszero(eq(caller, addr)) or iszero(eq(addr, caller)), return Some(addr).
+fn try_extract_caller_eq(cond: &Expr) -> Option<U256> {
+    let ch = (cond.opcode() == Some("iszero")).then(|| cond.children())??;
+    if ch.len() != 1 {
+        return None;
+    }
+    let eq = &ch[0];
+    if eq.opcode() != Some("eq") {
+        return None;
+    }
+    let eq_ch = eq.children()?;
+    if eq_ch.len() != 2 {
+        return None;
+    }
+    let (caller_side, addr_side) = (&eq_ch[0], &eq_ch[1]);
+    if is_caller_ref(caller_side) && addr_side.as_val().is_some() {
+        return addr_side.as_val();
+    }
+    if is_caller_ref(addr_side) && caller_side.as_val().is_some() {
+        return caller_side.as_val();
+    }
+    None
+}
+
+/// Recursively extract (addr, body) pairs and default from an if that is a caller-dispatch chain.
+fn extract_caller_chain_from_if(expr: &Expr) -> Option<(Vec<(U256, Trace)>, Trace)> {
+    let ch = expr.children()?;
+    if ch.is_empty() {
+        return None;
+    }
+    let cond = ch.first()?;
+    let addr = try_extract_caller_eq(cond)?;
+    let if_true = extract_seq(ch.get(1));
+    let if_false = extract_seq(ch.get(2));
+    // This if is: if not (caller == addr): then_branch else: body_for_addr
+    let body_for_addr = if_false;
+    let rest = if_true;
+    if rest.len() == 1 {
+        let next = &rest[0];
+        if next.opcode() == Some("if") {
+            if let Some((mut pairs, default)) = extract_caller_chain_from_if(next) {
+                pairs.insert(0, (addr, body_for_addr));
+                return Some((pairs, default));
+            }
+        }
+    }
+    // Single level or rest is not a caller-if: this addr gets body_for_addr, default is rest.
+    Some((vec![(addr, body_for_addr)], rest))
+}
+
+/// Flatten a trace that starts with a nested caller-dispatch into a flat list of
+/// "if caller == addr: body" at the same indent level.
+pub fn flatten_caller_dispatch(trace: &[Expr]) -> Trace {
+    if trace.is_empty() {
+        return trace.to_vec();
+    }
+    let expr = &trace[0];
+    // Top-level can be a single "if" or a "seq" containing one "if".
+    let if_expr = if expr.opcode() == Some("seq") {
+        expr.children()
+            .and_then(|c| if c.len() == 1 { c.first() } else { None })
+            .unwrap_or(expr)
+    } else {
+        expr
+    };
+    let (pairs, default) = match if_expr.opcode() {
+        Some("if") => match extract_caller_chain_from_if(if_expr) {
+            Some(x) => x,
+            None => return trace.to_vec(),
+        },
+        _ => return trace.to_vec(),
+    };
+    if pairs.len() < 2 {
+        return trace.to_vec();
+    }
+    let caller = Expr::atom("caller");
+    let mut result = Trace::new();
+    if trace.len() > 1 {
+        result.extend(trace[1..].to_vec());
+    }
+    for (addr, body) in pairs {
+        let cond = Expr::node2("eq", caller.clone(), Expr::Val(addr));
+        result.push(Expr::node2("if", cond, Expr::node("seq", body)));
+    }
+    result.extend(default);
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2284,5 +2387,116 @@ mod tests {
 
         let r3 = Expr::node2("range", Expr::val(64), Expr::val(32));
         assert!(!ranges_might_overlap(&r1, &r3));
+    }
+
+    // -------------------------------------------------------------------------
+    // flatten_caller_dispatch
+    // -------------------------------------------------------------------------
+
+    fn caller_eq_cond(addr: u64) -> Expr {
+        Expr::node1(
+            "iszero",
+            Expr::node2("eq", Expr::atom("caller"), Expr::val(addr)),
+        )
+    }
+
+    #[test]
+    fn test_flatten_caller_dispatch_two_levels() {
+        let addr_a = 0x1234u64;
+        let addr_b = 0x5678u64;
+        let inner = Expr::node3(
+            "if",
+            caller_eq_cond(addr_b),
+            Expr::node("seq", vec![Expr::node0("stop")]),
+            Expr::node("seq", vec![Expr::atom("body_b")]),
+        );
+        let outer = Expr::node3(
+            "if",
+            caller_eq_cond(addr_a),
+            Expr::node("seq", vec![inner]),
+            Expr::node("seq", vec![Expr::atom("body_a")]),
+        );
+        let trace = vec![outer];
+        let result = flatten_caller_dispatch(&trace);
+        assert!(result.len() >= 2, "expected at least 2 elements (2 ifs + default), got {}", result.len());
+        let first = result.first().unwrap();
+        assert_eq!(first.opcode(), Some("if"));
+        if let Some(ch) = first.children() {
+            assert_eq!(ch[0].opcode(), Some("eq"));
+            assert!(ch[0].contains_op("caller"));
+        }
+        let second = result.get(1).unwrap();
+        assert_eq!(second.opcode(), Some("if"));
+        assert!(result.len() >= 3, "expected default (stop) after the 2 ifs");
+    }
+
+    #[test]
+    fn test_flatten_caller_dispatch_single_if_no_op() {
+        let trace = vec![Expr::node3(
+            "if",
+            Expr::atom("cond"),
+            Expr::node("seq", vec![Expr::node0("stop")]),
+            Expr::node("seq", vec![Expr::node0("revert")]),
+        )];
+        let result = flatten_caller_dispatch(&trace);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].opcode(), Some("if"));
+    }
+
+    #[test]
+    fn test_flatten_caller_dispatch_empty_trace() {
+        let result = flatten_caller_dispatch(&[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_flatten_caller_dispatch_three_levels() {
+        let addr_c = 0x3333u64;
+        let inner = Expr::node3(
+            "if",
+            caller_eq_cond(addr_c),
+            Expr::node("seq", vec![Expr::node0("stop")]),
+            Expr::node("seq", vec![Expr::atom("body_c")]),
+        );
+        let middle = Expr::node3(
+            "if",
+            caller_eq_cond(0x5678u64),
+            Expr::node("seq", vec![inner]),
+            Expr::node("seq", vec![Expr::atom("body_b")]),
+        );
+        let outer = Expr::node3(
+            "if",
+            caller_eq_cond(0x1234u64),
+            Expr::node("seq", vec![middle]),
+            Expr::node("seq", vec![Expr::atom("body_a")]),
+        );
+        let result = flatten_caller_dispatch(&[outer]);
+        assert!(result.len() >= 3, "expected at least 3 ifs + default, got {}", result.len());
+        assert_eq!(result[0].opcode(), Some("if"));
+        assert_eq!(result[1].opcode(), Some("if"));
+        assert_eq!(result[2].opcode(), Some("if"));
+    }
+
+    /// When trace starts with a non-if (e.g. require), flatten is not applied; trace is returned unchanged.
+    #[test]
+    fn test_flatten_caller_dispatch_with_prefix_unchanged() {
+        let require = Expr::node1("require", Expr::node2("eq", Expr::atom("callvalue"), Expr::zero()));
+        let inner = Expr::node3(
+            "if",
+            caller_eq_cond(0x5678u64),
+            Expr::node("seq", vec![Expr::node0("revert")]),
+            Expr::node("seq", vec![Expr::atom("body_b")]),
+        );
+        let outer = Expr::node3(
+            "if",
+            caller_eq_cond(0x1234u64),
+            Expr::node("seq", vec![inner]),
+            Expr::node("seq", vec![Expr::atom("body_a")]),
+        );
+        let trace = vec![require.clone(), outer];
+        let result = flatten_caller_dispatch(&trace);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].opcode(), Some("require"));
+        assert_eq!(result[1].opcode(), Some("if"));
     }
 }

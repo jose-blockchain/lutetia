@@ -10,6 +10,97 @@ use crate::utils::helpers::{colors::*, is_array, padded_hex, precompiled_contrac
 use crate::utils::signatures::get_event_name;
 use primitive_types::U256;
 
+/// Extract seq children for pprint caller-dispatch.
+fn pprint_extract_seq(expr: Option<&Expr>) -> Vec<Expr> {
+    match expr {
+        Some(Expr::Node(op, ch)) if op == "seq" => ch.clone(),
+        Some(e) => vec![e.clone()],
+        None => vec![],
+    }
+}
+
+fn pprint_is_caller_ref(expr: &Expr) -> bool {
+    match expr {
+        Expr::Atom(s) if s.as_str() == "caller" => true,
+        Expr::Node(op, ch) if op == "mask_shl" && ch.len() >= 4 => {
+            ch.last().map_or(false, |e| pprint_is_caller_ref(e))
+        }
+        _ => false,
+    }
+}
+
+fn pprint_try_caller_eq(cond: &Expr) -> Option<U256> {
+    let ch = (cond.opcode() == Some("iszero")).then(|| cond.children())??;
+    if ch.len() != 1 {
+        return None;
+    }
+    let eq = &ch[0];
+    if eq.opcode() != Some("eq") {
+        return None;
+    }
+    let eq_ch = eq.children()?;
+    if eq_ch.len() != 2 {
+        return None;
+    }
+    let (a, b) = (&eq_ch[0], &eq_ch[1]);
+    if pprint_is_caller_ref(a) && b.as_val().is_some() {
+        return b.as_val();
+    }
+    if pprint_is_caller_ref(b) && a.as_val().is_some() {
+        return a.as_val();
+    }
+    None
+}
+
+/// Extract caller-dispatch chain from an "if" node for if/elif/else printing.
+/// Returns (pairs of (addr, body_trace), default_trace) or None.
+fn pprint_extract_caller_chain(expr: &Expr) -> Option<(Vec<(U256, Vec<Expr>)>, Vec<Expr>)> {
+    let ch = expr.children()?;
+    if ch.is_empty() {
+        return None;
+    }
+    let cond = ch.first()?;
+    let addr = pprint_try_caller_eq(cond)?;
+    let if_true = pprint_extract_seq(ch.get(1));
+    let if_false = pprint_extract_seq(ch.get(2));
+    let body = if_false;
+    let rest = if_true;
+    if rest.len() == 1 {
+        let next = &rest[0];
+        if next.opcode() == Some("if") {
+            if let Some((mut pairs, default)) = pprint_extract_caller_chain(next) {
+                pairs.insert(0, (addr, body));
+                return Some((pairs, default));
+            }
+        }
+    }
+    Some((vec![(addr, body)], rest))
+}
+
+/// True if expr is (LOOP True continue) — an infinite loop that only continues (no-op fall-through).
+fn is_loop_true_continue(expr: &Expr) -> bool {
+    let ch = match expr.children() {
+        Some(c) if expr.opcode() == Some("LOOP") && c.len() >= 2 => c,
+        _ => return false,
+    };
+    let cond = &ch[0];
+    let cond_true = matches!(cond, Expr::Bool(true))
+        || cond.as_val().map_or(false, |v| !v.is_zero());
+    if !cond_true {
+        return false;
+    }
+    let body = &ch[1];
+    let seq = match body.opcode() {
+        Some("seq") => body.children(),
+        _ => return false,
+    };
+    let seq = match seq {
+        Some(s) if s.len() == 1 => s,
+        _ => return false,
+    };
+    seq[0].opcode() == Some("continue")
+}
+
 // ---------------------------------------------------------------------------
 // Solidity panic codes
 // ---------------------------------------------------------------------------
@@ -41,7 +132,12 @@ pub fn prettify(expr: &Expr, add_color: bool) -> String {
         Expr::Val(v) => pretty_num(*v),
         Expr::Atom(s) => pretty_atom(s, add_color),
         Expr::Bool(b) => if *b { "True" } else { "False" }.to_string(),
-        Expr::Node(op, children) => pretty_node(op, children, add_color),
+        Expr::Node(op, children) => {
+            if op == "LOOP" && is_loop_true_continue(expr) {
+                return "pass".to_string();
+            }
+            pretty_node(op, children, add_color)
+        }
     }
 }
 
@@ -1005,6 +1101,24 @@ fn pprint_logic(expr: &Expr, indent: usize, add_color: bool, lines: &mut Vec<Str
 
     match expr.opcode() {
         Some("if") => {
+            if let Some((pairs, default)) = pprint_extract_caller_chain(expr) {
+                if pairs.len() >= 2 {
+                    // Print as if / elif / else for caller-dispatch chain.
+                    for (i, (addr, body)) in pairs.iter().enumerate() {
+                        let keyword = if i == 0 { "if" } else { "elif" };
+                        let addr_hex = padded_hex(*addr, 40);
+                        lines.push(format!("{prefix}{keyword} caller == {addr_hex}:"));
+                        let body_expr = Expr::node("seq", body.clone());
+                        pprint_seq(&body_expr, indent + 4, add_color, lines);
+                    }
+                    if !default.is_empty() {
+                        lines.push(format!("{prefix}else:"));
+                        let default_expr = Expr::node("seq", default);
+                        pprint_seq(&default_expr, indent + 4, add_color, lines);
+                    }
+                    return;
+                }
+            }
             if let Some(children) = expr.children() {
                 let cond = prettify(&children[0], add_color);
                 lines.push(format!("{prefix}if {cond}:"));
@@ -1041,6 +1155,19 @@ fn pprint_logic(expr: &Expr, indent: usize, add_color: bool, lines: &mut Vec<Str
         }
         Some("require") => {
             lines.push(format!("{prefix}{}", prettify(expr, add_color)));
+        }
+        Some("LOOP") => {
+            if is_loop_true_continue(expr) {
+                lines.push(format!("{prefix}pass"));
+            } else if let Some(children) = expr.children() {
+                let cond = children.first().map(|c| prettify(c, add_color)).unwrap_or_else(|| "True".to_string());
+                lines.push(format!("{prefix}while {cond}:"));
+                if let Some(body) = children.get(1) {
+                    pprint_seq(body, indent + 4, add_color, lines);
+                }
+            } else {
+                lines.push(format!("{prefix}{}", prettify(expr, add_color)));
+            }
         }
         Some("seq") => {
             if let Some(children) = expr.children() {
@@ -1186,5 +1313,148 @@ mod tests {
         let output = pprint_trace(&[if_expr], false);
         assert!(output.contains("if cond:"));
         assert!(!output.contains("else:"));
+    }
+
+    /// Caller-dispatch: nested "if not caller == A: ... else: body_A" prints as if/elif/else.
+    #[test]
+    fn test_caller_dispatch_pprint_if_elif_else() {
+        let addr_a = U256::from(0x1234567890abcdefu64);
+        let addr_b = U256::from(0xfedcba0987654321u64);
+        let cond_a = Expr::node1(
+            "iszero",
+            Expr::node2("eq", Expr::atom("caller"), Expr::Val(addr_a)),
+        );
+        let cond_b = Expr::node1(
+            "iszero",
+            Expr::node2("eq", Expr::atom("caller"), Expr::Val(addr_b)),
+        );
+        // if not caller == A: if not caller == B: default else: body_b else: body_a
+        let inner = Expr::node3(
+            "if",
+            cond_b,
+            Expr::node("seq", vec![Expr::atom("default")]),
+            Expr::node("seq", vec![Expr::atom("body_b")]),
+        );
+        let outer = Expr::node3(
+            "if",
+            cond_a,
+            Expr::node("seq", vec![inner]),
+            Expr::node("seq", vec![Expr::atom("body_a")]),
+        );
+        let output = pprint_trace(&[outer], false);
+        assert!(output.contains("if caller =="), "expected 'if caller ==' in:\n{output}");
+        assert!(output.contains("elif caller =="), "expected 'elif caller ==' in:\n{output}");
+        assert!(output.contains("else:"), "expected 'else:' in:\n{output}");
+        assert!(output.contains("body_a"));
+        assert!(output.contains("body_b"));
+        assert!(output.contains("default"));
+    }
+
+    /// (LOOP True continue) renders as "pass" for clearer pseudocode.
+    #[test]
+    fn test_loop_true_continue_renders_as_pass() {
+        let loop_expr = Expr::node2(
+            "LOOP",
+            Expr::Bool(true),
+            Expr::node("seq", vec![Expr::node0("continue")]),
+        );
+        assert_eq!(prettify(&loop_expr, false), "pass");
+        let trace = vec![loop_expr];
+        let output = pprint_trace(&trace, false);
+        assert!(output.contains("pass"));
+        assert!(!output.contains("LOOP"));
+        assert!(!output.contains("continue"));
+    }
+
+    /// LOOP with val(1) (truthy) and continue body also renders as "pass".
+    #[test]
+    fn test_loop_val_one_continue_renders_as_pass() {
+        let loop_expr = Expr::node2(
+            "LOOP",
+            Expr::val(1),
+            Expr::node("seq", vec![Expr::node0("continue")]),
+        );
+        assert!(super::is_loop_true_continue(&loop_expr));
+        assert_eq!(prettify(&loop_expr, false), "pass");
+    }
+
+    /// LOOP with false condition or non-continue body does not render as "pass".
+    #[test]
+    fn test_loop_false_or_non_continue_not_pass() {
+        let loop_false = Expr::node2(
+            "LOOP",
+            Expr::Bool(false),
+            Expr::node("seq", vec![Expr::node0("continue")]),
+        );
+        assert!(!super::is_loop_true_continue(&loop_false));
+        assert!(prettify(&loop_false, false).contains("LOOP"));
+
+        let loop_body_stop = Expr::node2(
+            "LOOP",
+            Expr::Bool(true),
+            Expr::node("seq", vec![Expr::node0("stop")]),
+        );
+        assert!(!super::is_loop_true_continue(&loop_body_stop));
+    }
+
+    /// Three-level caller-dispatch prints as if / elif / elif / else.
+    #[test]
+    fn test_caller_dispatch_three_levels_if_elif_else() {
+        let addrs = [0x1111u64, 0x2222u64, 0x3333u64];
+        let conds: Vec<Expr> = addrs
+            .iter()
+            .map(|&a| {
+                Expr::node1(
+                    "iszero",
+                    Expr::node2("eq", Expr::atom("caller"), Expr::val(a)),
+                )
+            })
+            .collect();
+        let innermost = Expr::node3(
+            "if",
+            conds[2].clone(),
+            Expr::node("seq", vec![Expr::atom("default")]),
+            Expr::node("seq", vec![Expr::atom("body_c")]),
+        );
+        let middle = Expr::node3(
+            "if",
+            conds[1].clone(),
+            Expr::node("seq", vec![innermost]),
+            Expr::node("seq", vec![Expr::atom("body_b")]),
+        );
+        let outer = Expr::node3(
+            "if",
+            conds[0].clone(),
+            Expr::node("seq", vec![middle]),
+            Expr::node("seq", vec![Expr::atom("body_a")]),
+        );
+        let output = pprint_trace(&[outer], false);
+        let elif_count = output.matches("elif caller ==").count();
+        assert_eq!(elif_count, 2, "expected 2 elif lines, got {} in:\n{}", elif_count, output);
+        assert!(output.contains("if caller =="));
+        assert!(output.contains("body_a"));
+        assert!(output.contains("body_b"));
+        assert!(output.contains("body_c"));
+        assert!(output.contains("default"));
+        assert!(output.contains("else:"));
+    }
+
+    /// Single caller check (only one pair) is printed as normal if/else, not elif.
+    #[test]
+    fn test_caller_dispatch_single_stays_if_else() {
+        let addr = U256::from(0xabu64);
+        let cond = Expr::node1(
+            "iszero",
+            Expr::node2("eq", Expr::atom("caller"), Expr::Val(addr)),
+        );
+        let if_expr = Expr::node3(
+            "if",
+            cond,
+            Expr::node("seq", vec![Expr::atom("then")]),
+            Expr::node("seq", vec![Expr::atom("else_body")]),
+        );
+        let output = pprint_trace(&[if_expr], false);
+        assert!(output.contains("if not caller ==") || output.contains("if caller =="));
+        assert!(output.contains("else_body"));
     }
 }
